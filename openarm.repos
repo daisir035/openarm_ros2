@@ -15,5 +15,5 @@
 repositories:
   openarm_can:
     type: git
-    url: https://github.com/enactic/openarm_can.git
+    url: https://github.com/daisir035/openarm_can.git
     version: main

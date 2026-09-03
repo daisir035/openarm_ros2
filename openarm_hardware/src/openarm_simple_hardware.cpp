@@ -59,6 +59,11 @@ bool OpenArmHW::parse_config(const hardware_interface::HardwareInfo& info) {
     std::transform(value.begin(), value.end(), value.begin(), ::tolower);
     can_fd_ = (value == "true");
   }
+  if (!can_fd_) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "ZK motor protocol requires CAN FD");
+    return false;
+  }
 
   // Parse control gains
   for (size_t i = 1; i <= ARM_DOF; ++i) {
@@ -143,24 +148,13 @@ hardware_interface::CallbackReturn OpenArmHW::on_init(
     return CallbackReturn::ERROR;
   }
 
-  // Initialize OpenArm with configurable CAN-FD setting
+  // Initialize the ZK backend with arm IDs 1-7 and optional gripper ID 8.
   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"),
-              "Initializing OpenArm on %s with CAN-FD %s...",
-              can_interface_.c_str(), can_fd_ ? "enabled" : "disabled");
-  openarm_ =
-      std::make_unique<openarm::can::socket::OpenArm>(can_interface_, can_fd_);
-
-  // Initialize arm motors with V10 defaults
-  openarm_->init_arm_motors(DEFAULT_MOTOR_TYPES, DEFAULT_SEND_CAN_IDS,
-                            DEFAULT_RECV_CAN_IDS);
-
-  // Initialize gripper if enabled
-  if (hand_) {
-    RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Initializing gripper...");
-    openarm_->init_gripper_motor(DEFAULT_GRIPPER_MOTOR_TYPE,
-                                 DEFAULT_GRIPPER_SEND_CAN_ID,
-                                 DEFAULT_GRIPPER_RECV_CAN_ID);
-  }
+              "Initializing OpenArm ZK motors on %s...", can_interface_.c_str());
+  std::vector<uint8_t> motor_ids = {1, 2, 3, 4, 5, 6, 7};
+  if (hand_) motor_ids.push_back(8);
+  openarm_ = std::make_unique<openarm::can::socket::ZKOpenArm>(can_interface_,
+                                                               motor_ids);
 
   // Initialize state and command vectors based on generated joint count
   const size_t total_joints = joint_names_.size();
@@ -182,7 +176,7 @@ hardware_interface::CallbackReturn OpenArmHW::on_configure(
   // Set callback mode to ignore during configuration
   openarm_->refresh_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  openarm_->recv_all();
+  openarm_->recv_all(5000);
 
   return CallbackReturn::SUCCESS;
 }
@@ -223,10 +217,9 @@ OpenArmHW::export_command_interfaces() {
 hardware_interface::CallbackReturn OpenArmHW::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Activating OpenArm V10...");
-  openarm_->set_callback_mode_all(openarm::damiao_motor::CallbackMode::STATE);
   openarm_->enable_all();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  openarm_->recv_all();
+  openarm_->recv_all(5000);
 
   // Return to zero position
   return_to_zero();
@@ -243,7 +236,7 @@ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
   for (int i = 0; i < 3; ++i) {
     openarm_->disable_all();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    openarm_->recv_all();
+    openarm_->recv_all(5000);
   }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "OpenArm V10 deactivated");
@@ -252,25 +245,19 @@ hardware_interface::CallbackReturn OpenArmHW::on_deactivate(
 
 hardware_interface::return_type OpenArmHW::read(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
-  // Receive all motor states
-  openarm_->refresh_all();
-  openarm_->recv_all();
-
-  // Read arm joint states
-  const auto& arm_motors = openarm_->get_arm().get_motors();
-  for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
-    pos_states_[i] = arm_motors[i].get_position();
-    vel_states_[i] = arm_motors[i].get_velocity();
-    tau_states_[i] = arm_motors[i].get_torque();
+  const auto motors = openarm_->get_motors();
+  for (size_t i = 0; i < ARM_DOF && i < motors.size(); ++i) {
+    pos_states_[i] = motors[i].get_position();
+    vel_states_[i] = motors[i].get_velocity();
+    tau_states_[i] = motors[i].get_torque();
   }
 
   // Read gripper state if enabled
   if (hand_ && joint_names_.size() > ARM_DOF) {
-    const auto& gripper_motors = openarm_->get_gripper().get_motors();
-    if (!gripper_motors.empty()) {
+    if (motors.size() > ARM_DOF) {
       // TODO the mappings are approximates
       // Convert motor position (radians) to joint value (0-0.044m)
-      double motor_pos = gripper_motors[0].get_position();
+      double motor_pos = motors[ARM_DOF].get_position();
       pos_states_[ARM_DOF] = motor_radians_to_joint(motor_pos);
 
       // Unimplemented: Velocity and torque mapping
@@ -285,20 +272,24 @@ hardware_interface::return_type OpenArmHW::read(
 hardware_interface::return_type OpenArmHW::write(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
   // Control arm motors with MIT control
-  std::vector<openarm::damiao_motor::MITParam> arm_params;
+  std::vector<openarm::damiao_motor::MITParam> motor_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back(
+    motor_params.push_back(
         {kp_[i], kd_[i], pos_commands_[i], vel_commands_[i], tau_commands_[i]});
   }
-  openarm_->get_arm().mit_control_all(arm_params);
-  // Control gripper if enabled
   if (hand_ && joint_names_.size() > ARM_DOF) {
-    // TODO the true mappings are unimplemented.
-    double motor_command = joint_to_motor_radians(pos_commands_[ARM_DOF]);
-    openarm_->get_gripper().mit_control_all(
-        {{gripper_kp_, gripper_kd_, motor_command, 0.0, 0.0}});
+    motor_params.push_back({gripper_kp_, gripper_kd_,
+                            joint_to_motor_radians(pos_commands_[ARM_DOF]),
+                            0.0, 0.0});
   }
-  openarm_->recv_all(100);
+  openarm_->get_arm().mit_control_all(motor_params);
+  openarm_->recv_all(1000);
+  if (openarm_->last_received_count() != ARM_DOF + (hand_ ? 1 : 0)) {
+    RCLCPP_ERROR(rclcpp::get_logger("OpenArmHW"),
+                 "Received %zu/%zu ZK motor states",
+                 openarm_->last_received_count(), ARM_DOF + (hand_ ? 1 : 0));
+    return hardware_interface::return_type::ERROR;
+  }
   return hardware_interface::return_type::OK;
 }
 
@@ -307,20 +298,19 @@ void OpenArmHW::return_to_zero() {
 
   openarm_->refresh_all();
   // Return arm to zero with MIT control
-  std::vector<openarm::damiao_motor::MITParam> arm_params;
+  std::vector<openarm::damiao_motor::MITParam> motor_params;
   for (size_t i = 0; i < ARM_DOF; ++i) {
-    arm_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
+    motor_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
   }
-  openarm_->get_arm().mit_control_all(arm_params);
-
-  // Return gripper to zero if enabled
   if (hand_) {
-    openarm_->get_gripper().mit_control_all(
-        {{gripper_kp_, gripper_kd_, GRIPPER_JOINT_0_POSITION, 0.0, 0.0}});
+    motor_params.push_back({gripper_kp_, gripper_kd_,
+                            joint_to_motor_radians(GRIPPER_JOINT_0_POSITION),
+                            0.0, 0.0});
   }
+  openarm_->get_arm().mit_control_all(motor_params);
   std::this_thread::sleep_for(std::chrono::microseconds(1000));
-  openarm_->recv_all();
-  const auto& arm_motors = openarm_->get_arm().get_motors();
+  openarm_->recv_all(5000);
+  const auto arm_motors = openarm_->get_arm().get_motors();
 
   std::vector<double> start_pos(ARM_DOF, 0.0);
   for (size_t i = 0; i < ARM_DOF && i < arm_motors.size(); ++i) {
@@ -333,44 +323,24 @@ void OpenArmHW::return_to_zero() {
   for (int step = 0; step <= steps; ++step) {
     double t = static_cast<double>(step) / steps;  // 0.0 → 1.0
 
-    std::vector<openarm::damiao_motor::MITParam> arm_params;
+    std::vector<openarm::damiao_motor::MITParam> motor_params;
     for (size_t i = 0; i < ARM_DOF; ++i) {
       double target = start_pos[i] + t * (ZERO_POSITION[i] - start_pos[i]);
-      arm_params.push_back({kp_[i], kd_[i], target, 0.0, 0.0});
+      motor_params.push_back({kp_[i], kd_[i], target, 0.0, 0.0});
     }
-    openarm_->get_arm().mit_control_all(arm_params);
-
     if (hand_) {
-      openarm_->get_gripper().mit_control_all(
-          {{GRIPPER_KP, GRIPPER_KD, GRIPPER_JOINT_0_POSITION, 0.0, 0.0}});
+      motor_params.push_back({gripper_kp_, gripper_kd_,
+                              joint_to_motor_radians(GRIPPER_JOINT_0_POSITION),
+                              0.0, 0.0});
     }
+    openarm_->get_arm().mit_control_all(motor_params);
 
-    openarm_->recv_all();
+    openarm_->recv_all(1000);
     std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
   }
 
   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Reached zero position");
 }
-
-// void OpenArmHW::return_to_zero() {
-//   RCLCPP_INFO(rclcpp::get_logger("OpenArmHW"), "Returning to zero
-//   position...");
-
-//   // Return arm to zero with MIT control
-//   std::vector<openarm::damiao_motor::MITParam> arm_params;
-//   for (size_t i = 0; i < ARM_DOF; ++i) {
-//     arm_params.push_back({kp_[i], kd_[i], 0.0, 0.0, 0.0});
-//   }
-//   openarm_->get_arm().mit_control_all(arm_params);
-
-//   // Return gripper to zero if enabled
-//   if (hand_) {
-//     openarm_->get_gripper().mit_control_all(
-//         {{GRIPPER_KP, GRIPPER_KD, GRIPPER_JOINT_0_POSITION, 0.0, 0.0}});
-//   }
-//   std::this_thread::sleep_for(std::chrono::microseconds(1000));
-//   openarm_->recv_all();
-// }
 
 double OpenArmHW::joint_to_motor_radians(double joint_value) {
   if (ee_type_ == "pinch_gripper") {
