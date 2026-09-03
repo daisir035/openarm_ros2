@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import xml.etree.ElementTree as ET
 import xacro
 
 from ament_index_python.packages import get_package_share_directory
@@ -31,9 +32,37 @@ VALID_ARM_TYPES = {
 }
 
 
+def single_motor_test_description(robot_description, can_interface, kp, kd):
+    """Keep left joint 1 real and replace all other unavailable motors."""
+    root = ET.fromstring(robot_description)
+    controls = {
+        control.get("name"): control
+        for control in root.findall("ros2_control")
+    }
+    try:
+        left_hardware = controls["openarm_left_hardware_interface"].find("hardware")
+        right_hardware = controls["openarm_right_hardware_interface"].find("hardware")
+        left_params = {
+            param.get("name"): param for param in left_hardware.findall("param")
+        }
+        left_params["can_interface"].text = can_interface
+        left_params["kp1"].text = kp
+        left_params["kd1"].text = kd
+    except (KeyError, AttributeError) as error:
+        raise ValueError("OpenArm bimanual ros2_control description is incompatible") from error
+
+    ET.SubElement(left_hardware, "param", name="single_motor_test").text = "true"
+    right_hardware.clear()
+    ET.SubElement(right_hardware, "plugin").text = "mock_components/GenericSystem"
+    ET.SubElement(right_hardware, "param", name="fake_sensor_commands").text = "false"
+    ET.SubElement(right_hardware, "param", name="state_following_offset").text = "0.0"
+    return ET.tostring(root, encoding="unicode")
+
+
 def resolve_arm_config(arm_type_str: str) -> tuple[str, str]:
     """
     Resolve folder name and xacro file name from arm_type.
+
     Accepts: v1.0, v10, v1_0, openarm_v1.0, openarm_v10, openarm_v1_0 (and v2.0 variants)
     Raises ValueError if arm_type is not recognized.
     """
@@ -54,14 +83,18 @@ def namespace_from_context(context, arm_prefix):
     return None
 
 
-def generate_robot_description(context: LaunchContext, description_package, description_file,
-                               arm_type, use_fake_hardware, right_can_interface, left_can_interface):
+def generate_robot_description(
+    context: LaunchContext, description_package, description_file,
+    arm_type, use_fake_hardware, right_can_interface, left_can_interface,
+    single_motor_test, single_motor_kp, single_motor_kd,
+):
     """Generate robot description using xacro processing."""
     description_package_str = context.perform_substitution(description_package)
     arm_type_str = context.perform_substitution(arm_type)
     use_fake_hardware_str = context.perform_substitution(use_fake_hardware)
     right_can_interface_str = context.perform_substitution(right_can_interface)
     left_can_interface_str = context.perform_substitution(left_can_interface)
+    single_motor_test_str = context.perform_substitution(single_motor_test)
 
     folder_name, file_name = resolve_arm_config(arm_type_str)
 
@@ -75,25 +108,37 @@ def generate_robot_description(context: LaunchContext, description_package, desc
         mappings={
             "arm_type": arm_type_str,
             "bimanual": "true",
-            "use_fake_hardware": use_fake_hardware_str,
+            "use_fake_hardware": (
+                "false" if single_motor_test_str == "true" else use_fake_hardware_str
+            ),
             "ros2_control": "true",
             "right_can_interface": right_can_interface_str,
             "left_can_interface": left_can_interface_str,
         }
     ).toprettyxml(indent="  ")
 
+    if single_motor_test_str == "true":
+        robot_description = single_motor_test_description(
+            robot_description,
+            left_can_interface_str,
+            context.perform_substitution(single_motor_kp),
+            context.perform_substitution(single_motor_kd),
+        )
+
     return robot_description
 
 
 def robot_nodes_spawner(context: LaunchContext, description_package, description_file,
                         arm_type, use_fake_hardware, controllers_file,
-                        right_can_interface, left_can_interface, arm_prefix):
+                        right_can_interface, left_can_interface, arm_prefix,
+                        single_motor_test, single_motor_kp, single_motor_kd):
     """Spawn both robot state publisher and control nodes with shared robot description."""
     namespace = namespace_from_context(context, arm_prefix)
 
     robot_description = generate_robot_description(
         context, description_package, description_file, arm_type,
         use_fake_hardware, right_can_interface, left_can_interface,
+        single_motor_test, single_motor_kp, single_motor_kd,
     )
 
     controllers_file_str = context.perform_substitution(controllers_file)
@@ -156,7 +201,6 @@ def controller_spawner(context: LaunchContext, robot_controller, arm_prefix):
 
 def generate_launch_description():
     """Generate launch description for OpenArm bimanual configuration."""
-
     declared_arguments = [
         DeclareLaunchArgument(
             "description_package",
@@ -171,13 +215,24 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "arm_type",
             default_value="openarm_v2.0",
-            description="Arm type. Accepts: v1.0, v10, openarm_v1.0, v2.0, v20, openarm_v2.0, etc.",
+            description=(
+                "Arm type. Accepts: v1.0, v10, openarm_v1.0, "
+                "v2.0, v20, openarm_v2.0, etc."
+            ),
         ),
         DeclareLaunchArgument(
             "use_fake_hardware",
             default_value="true",
             description="Use fake hardware instead of real hardware.",
         ),
+        DeclareLaunchArgument(
+            "single_motor_test",
+            default_value="false",
+            choices=["true", "false"],
+            description="Use only left ZK motor ID 1; emulate every other motor.",
+        ),
+        DeclareLaunchArgument("single_motor_kp", default_value="10.0"),
+        DeclareLaunchArgument("single_motor_kd", default_value="1.0"),
         DeclareLaunchArgument(
             "robot_controller",
             default_value="joint_trajectory_controller",
@@ -216,6 +271,9 @@ def generate_launch_description():
     description_file = LaunchConfiguration("description_file")
     arm_type = LaunchConfiguration("arm_type")
     use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    single_motor_test = LaunchConfiguration("single_motor_test")
+    single_motor_kp = LaunchConfiguration("single_motor_kp")
+    single_motor_kd = LaunchConfiguration("single_motor_kd")
     robot_controller = LaunchConfiguration("robot_controller")
     runtime_config_package = LaunchConfiguration("runtime_config_package")
     controllers_file = LaunchConfiguration("controllers_file")
@@ -232,7 +290,8 @@ def generate_launch_description():
         function=robot_nodes_spawner,
         args=[description_package, description_file, arm_type,
               use_fake_hardware, controllers_file,
-              right_can_interface, left_can_interface, arm_prefix]
+              right_can_interface, left_can_interface, arm_prefix,
+              single_motor_test, single_motor_kp, single_motor_kd]
     )
 
     rviz_config_file = PathJoinSubstitution(

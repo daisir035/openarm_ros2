@@ -66,6 +66,11 @@ class OpenArmHW : public hardware_interface::SystemInterface {
       const rclcpp_lifecycle::State& previous_state) override;
 
   TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
+  hardware_interface::return_type perform_command_mode_switch(
+      const std::vector<std::string>& start_interfaces,
+      const std::vector<std::string>& stop_interfaces) override;
+
+  TEMPLATES__ROS2_CONTROL__VISIBILITY_PUBLIC
   hardware_interface::return_type read(const rclcpp::Time& time,
                                        const rclcpp::Duration& period) override;
 
@@ -95,6 +100,8 @@ class OpenArmHW : public hardware_interface::SystemInterface {
   std::string ee_type_;
   bool hand_;
   bool can_fd_;
+  bool single_motor_test_ = false;
+  bool single_motor_controller_active_ = false;
 
   // OpenArm instance
   std::unique_ptr<openarm::can::socket::ZKOpenArm> openarm_;
