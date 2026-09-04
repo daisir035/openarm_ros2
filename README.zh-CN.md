@@ -92,6 +92,27 @@ URDF/xacro 中的 `OpenArmHW` 支持以下硬件参数：
 
 机械臂启动时会使能电机并缓慢回到零位。首次连接真机前，应确认机械零位、关节方向、CAN 接口和急停条件，避免在人员或障碍物附近直接启动。
 
+## RViz 关节控制与示教
+
+MoveIt 的 RViz 配置会自动加载 `关节控制` 面板。面板读取当前关节状态和
+URDF 限位，通过现有左右臂轨迹控制器发送分段目标。先使用上面的纯假硬件
+命令验证，再连接真机。
+
+录制关节轨迹：
+
+```bash
+ros2 run openarmx_teach record_joint_states_always --rate 10 --outfile demo.yaml
+```
+
+回放全部关节：
+
+```bash
+ros2 run openarmx_teach play_joint_trajectory demo.yaml --all-joints
+```
+
+详细说明见 `openarmx_joint_slider_panel/README_CN.md` 和
+`openarmx_teach/README_CN.md`。
+
 ## 故障排查
 
 ```bash
@@ -104,4 +125,6 @@ candump can0
 
 ## 许可证
 
-本项目使用 Apache License 2.0，详见 [LICENSE](LICENSE)。
+主项目使用 Apache License 2.0，详见 [LICENSE](LICENSE)。迁移的
+`openarmx_joint_slider_panel` 和 `openarmx_teach` 独立保留 CC BY-NC-SA
+4.0 许可证。

@@ -11,6 +11,8 @@ Panels:
     Tree Height: 254
   - Class: rviz_common/Help
     Name: Help
+  - Class: openarmx_joint_slider_panel/JointSliderPanel
+    Name: 关节控制
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
